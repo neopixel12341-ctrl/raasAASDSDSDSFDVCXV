@@ -1,0 +1,536 @@
+-- Ultimate Persistent SkidFling + Smart Exclusions (FULL, plug-and-play)
+-- Places a left-edge GUI at 2/5 down the screen, smart partial autofill for display/username,
+-- click-to-remove exclusions, persistent storage (writefile/readfile), F-key toggle,
+-- waits for PREPARE<=13s or SURVIVE to start, stacks persistent loopflings (3.5s between new targets),
+-- continues after creature respawn by restarting scan (does NOT reapply prior active targets).
+--
+-- NOTE: This script assumes an exploit environment with writefile/readfile/isfile functions for persistence.
+-- If running somewhere else, replace persistence calls with appropriate storage API.
+
+-- ===== Services / locals =====
+local Players = game:GetService("Players")
+local Player = Players.LocalPlayer
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterGui = game:GetService("StarterGui")
+local UserInputService = game:GetService("UserInputService")
+
+-- ===== Persistence (uses writefile/readfile) =====
+local EXCLUSIONS_SAVEFILE = "skidfling_exclusions.json"
+local function loadExclusions()
+    if type(isfile) == "function" and isfile(EXCLUSIONS_SAVEFILE) then
+        local ok, raw = pcall(function() return readfile(EXCLUSIONS_SAVEFILE) end)
+        if ok and raw and raw ~= "" then
+            local ok2, tbl = pcall(function() return game:GetService("HttpService"):JSONDecode(raw) end)
+            if ok2 and type(tbl) == "table" then
+                return tbl
+            end
+        end
+    end
+    return {}
+end
+local function saveExclusions(tbl)
+    if type(writefile) == "function" then
+        local ok, json = pcall(function() return game:GetService("HttpService"):JSONEncode(tbl) end)
+        if ok then
+            pcall(function() writefile(EXCLUSIONS_SAVEFILE, json) end)
+        end
+    end
+end
+
+-- ===== Globals & config =====
+getgenv().Exclusions = getgenv().Exclusions or loadExclusions() -- list of username strings
+getgenv().Welcome = getgenv().Welcome or false
+getgenv().FPDH = getgenv().FPDH or workspace.FallenPartsDestroyHeight
+getgenv().FlingEnabled = getgenv().FlingEnabled or true
+getgenv().AllBool = getgenv().AllBool or false
+
+local FLING_INTERVAL = 3.5 -- seconds between starting flings on new players
+
+-- Active fling trackers: map userId -> true (and keep coroutine running until target no longer valid)
+local ActiveFlingTargets = {}
+
+-- ===== Utility =====
+local function Notify(title, text, dur)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {Title = title, Text = text, Duration = dur or 3})
+    end)
+end
+
+local function findPlayersByPartial(partial)
+    partial = tostring(partial or ""):lower()
+    local matches = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= Player then
+            local uname = (p.Name or ""):lower()
+            local dname = (p.DisplayName or ""):lower()
+            if uname:sub(1, #partial) == partial or dname:sub(1, #partial) == partial then
+                table.insert(matches, p)
+            end
+        end
+    end
+    return matches
+end
+
+-- ===== Original SkidFling logic (preserve behavior; kept faithful / robust) =====
+local function SkidFling(TargetPlayer)
+    -- The following function is intended to be as close as reasonably possible to your original
+    -- SkidFling behavior while adding pcall safety around dangerous ops so it doesn't break loops.
+    local success, err = pcall(function()
+        local Character = Player.Character
+        local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+        local RootPart = Humanoid and Humanoid.RootPart
+
+        if not TargetPlayer or not TargetPlayer.Character then
+            return
+        end
+
+        local TCharacter = TargetPlayer.Character
+        local THumanoid
+        local TRootPart
+        local THead
+        local Accessory
+        local Handle
+
+        if TCharacter:FindFirstChildOfClass("Humanoid") then
+            THumanoid = TCharacter:FindFirstChildOfClass("Humanoid")
+        end
+        if THumanoid and THumanoid.RootPart then
+            TRootPart = THumanoid.RootPart
+        end
+        if TCharacter:FindFirstChild("Head") then
+            THead = TCharacter.Head
+        end
+        -- pick first accessory if present
+        if TCharacter:FindFirstChildOfClass("Accessory") then
+            Accessory = TCharacter:FindFirstChildOfClass("Accessory")
+        end
+        if Accessory and Accessory:FindFirstChild("Handle") then
+            Handle = Accessory.Handle
+        end
+
+        if Character and Humanoid and RootPart then
+            if RootPart.Velocity.Magnitude < 50 then
+                getgenv().OldPos = RootPart.CFrame
+            end
+            if THumanoid and THumanoid.Sit and not getgenv().AllBool then
+                return Notify("Error Occurred", "Targeting is sitting", 5)
+            end
+
+            if THead then
+                workspace.CurrentCamera.CameraSubject = THead
+            elseif not THead and Handle then
+                workspace.CurrentCamera.CameraSubject = Handle
+            elseif THumanoid and TRootPart then
+                workspace.CurrentCamera.CameraSubject = THumanoid
+            end
+
+            if not TCharacter:FindFirstChildWhichIsA("BasePart") then
+                return
+            end
+
+            local FPos = function(BasePart, Pos, Ang)
+                if not RootPart or not Character or not Character.PrimaryPart then return end
+                RootPart.CFrame = CFrame.new(BasePart.Position) * Pos * Ang
+                pcall(function() Character:SetPrimaryPartCFrame(CFrame.new(BasePart.Position) * Pos * Ang) end)
+                if RootPart then
+                    RootPart.Velocity = Vector3.new(9e7, 9e7 * 10, 9e7)
+                    RootPart.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
+                end
+            end
+
+            local SFBasePart = function(BasePart)
+                local TimeToWait = 2
+                local Time = tick()
+                local Angle = 0
+
+                repeat
+                    if RootPart and THumanoid then
+                        if BasePart.Velocity.Magnitude < 50 then
+                            Angle = Angle + 100
+
+                            FPos(BasePart, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
+                            task.wait()
+
+                            FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
+                            task.wait()
+
+                            FPos(BasePart, CFrame.new(2.25, 1.5, -2.25) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
+                            task.wait()
+
+                            FPos(BasePart, CFrame.new(-2.25, -1.5, 2.25) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
+                            task.wait()
+
+                            FPos(BasePart, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0))
+                            task.wait()
+
+                            FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0))
+                            task.wait()
+                        else
+                            FPos(BasePart, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(90), 0, 0))
+                            task.wait()
+
+                            FPos(BasePart, CFrame.new(0, -1.5, -THumanoid.WalkSpeed), CFrame.Angles(0, 0, 0))
+                            task.wait()
+
+                            FPos(BasePart, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(90), 0, 0))
+                            task.wait()
+
+                            FPos(BasePart, CFrame.new(0, 1.5, TRootPart.Velocity.Magnitude / 1.25), CFrame.Angles(math.rad(90), 0, 0))
+                            task.wait()
+
+                            FPos(BasePart, CFrame.new(0, -1.5, -TRootPart.Velocity.Magnitude / 1.25), CFrame.Angles(0, 0, 0))
+                            task.wait()
+
+                            FPos(BasePart, CFrame.new(0, 1.5, TRootPart.Velocity.Magnitude / 1.25), CFrame.Angles(math.rad(90), 0, 0))
+                            task.wait()
+
+                            FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(90), 0, 0))
+                            task.wait()
+
+                            FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(0, 0, 0))
+                            task.wait()
+
+                            FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(-90), 0, 0))
+                            task.wait()
+
+                            FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(0, 0, 0))
+                            task.wait()
+                        end
+                    else
+                        break
+                    end
+                until BasePart.Velocity.Magnitude > 500
+                      or not BasePart.Parent
+                      or (TargetPlayer.Parent ~= Players)
+                      or (TargetPlayer.Character ~= TCharacter)
+                      or (THumanoid and THumanoid.Sit)
+                      or (Humanoid and Humanoid.Health <= 0)
+                      or tick() > Time + TimeToWait
+            end
+
+            workspace.FallenPartsDestroyHeight = 0/0
+
+            local BV = Instance.new("BodyVelocity")
+            BV.Name = "EpixVel"
+            BV.Parent = RootPart
+            BV.Velocity = Vector3.new(9e8, 9e8, 9e8)
+            BV.MaxForce = Vector3.new(1/0, 1/0, 1/0)
+
+            Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+
+            if TRootPart and THead then
+                if (TRootPart.CFrame.p - THead.CFrame.p).Magnitude > 5 then
+                    SFBasePart(THead)
+                else
+                    SFBasePart(TRootPart)
+                end
+            elseif TRootPart and not THead then
+                SFBasePart(TRootPart)
+            elseif not TRootPart and THead then
+                SFBasePart(THead)
+            elseif not TRootPart and not THead and Accessory and Handle then
+                SFBasePart(Handle)
+            else
+                return Notify("Error Occurred", "Target is missing everything", 5)
+            end
+
+            if BV and BV.Parent then BV:Destroy() end
+            Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, true)
+            workspace.CurrentCamera.CameraSubject = Humanoid
+
+            repeat
+                if not getgenv().OldPos then break end
+                if RootPart and getgenv().OldPos then
+                    RootPart.CFrame = getgenv().OldPos * CFrame.new(0, .5, 0)
+                    pcall(function() Character:SetPrimaryPartCFrame(getgenv().OldPos * CFrame.new(0, .5, 0)) end)
+                end
+                if Humanoid then Humanoid:ChangeState("GettingUp") end
+                if Character then
+                    for _, x in ipairs(Character:GetChildren()) do
+                        if x:IsA("BasePart") then
+                            x.Velocity, x.RotVelocity = Vector3.new(), Vector3.new()
+                        end
+                    end
+                end
+                task.wait()
+            until (RootPart and getgenv().OldPos and (RootPart.Position - getgenv().OldPos.p).Magnitude < 25) or not RootPart or not getgenv().OldPos
+            workspace.FallenPartsDestroyHeight = getgenv().FPDH
+        else
+            return Notify("Error Occurred", "Random error", 5)
+        end
+    end)
+    if not success then
+        -- swallow/skippable errors when player's character temporary missing/respawning
+        -- (avoids spamming notifications). Only notify if it's something serious.
+        -- We'll ignore errors since the user's request was to suppress transient errors during respawn.
+        -- Uncomment below to debug:
+        -- Notify("SkidFling Error", tostring(err), 4)
+    end
+end
+
+-- ===== GUI creation: left edge, 2/5 up =====
+local function createGui()
+    if not Player then return end
+    local existing = Player:FindFirstChild("PlayerGui") and Player.PlayerGui:FindFirstChild("SkidFlingGUI")
+    if existing then return existing end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "SkidFlingGUI"
+    sg.ResetOnSpawn = false
+    sg.Parent = Player:WaitForChild("PlayerGui")
+
+    local frame = Instance.new("Frame")
+    frame.Name = "MainFrame"
+    frame.Size = UDim2.new(0, 220, 0, 320)
+    frame.Position = UDim2.new(0, 0, 2/5, 0) -- left edge, 2/5 down
+    frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    frame.BorderSizePixel = 0
+    frame.Parent = sg
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, 28)
+    title.Position = UDim2.new(0, 0, 0, 0)
+    title.Text = "Exclusions"
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.BackgroundTransparency = 1
+    title.Parent = frame
+
+    local input = Instance.new("TextBox")
+    input.Name = "Input"
+    input.Size = UDim2.new(1, -10, 0, 28)
+    input.Position = UDim2.new(0, 5, 0, 34)
+    input.PlaceholderText = "" -- user requested removing default "textbox"
+    input.Text = ""           -- ensure blank
+    input.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+    input.TextColor3 = Color3.fromRGB(255, 255, 255)
+    input.ClearTextOnFocus = false
+    input.Parent = frame
+
+    local list = Instance.new("ScrollingFrame")
+    list.Name = "List"
+    list.Size = UDim2.new(1, -10, 1, -80)
+    list.Position = UDim2.new(0, 5, 0, 70)
+    list.BackgroundTransparency = 1
+    list.ScrollBarThickness = 6
+    list.Parent = frame
+
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 6)
+    layout.Parent = list
+
+    local function refresh()
+        for _, child in ipairs(list:GetChildren()) do
+            if child:IsA("TextButton") then child:Destroy() end
+        end
+        for i, name in ipairs(getgenv().Exclusions) do
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(1, -10, 0, 26)
+            btn.Position = UDim2.new(0, 5, 0, 0)
+            btn.Text = name -- display username for readability
+            btn.BackgroundColor3 = Color3.fromRGB(55, 55, 55)
+            btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            btn.Parent = list
+            btn.LayoutOrder = i
+            btn.MouseButton1Click:Connect(function()
+                for idx = #getgenv().Exclusions, 1, -1 do
+                    if getgenv().Exclusions[idx] == name then
+                        table.remove(getgenv().Exclusions, idx)
+                        break
+                    end
+                end
+                saveExclusions(getgenv().Exclusions)
+                refresh()
+            end)
+        end
+        list.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 6)
+    end
+
+    -- smart add on enter (FocusLost with enter true)
+    input.FocusLost:Connect(function(enter)
+        if not enter then return end
+        local txt = tostring(input.Text or ""):match("^%s*(.-)%s*$") or ""
+        if txt == "" then input.Text = "" return end
+
+        local matches = findPlayersByPartial(txt)
+        if #matches == 0 then
+            Notify("Exclusion Error", "No player found for '" .. txt .. "'", 3)
+        elseif #matches > 1 then
+            -- check for exact match first
+            local exact = nil
+            for _, pl in ipairs(matches) do
+                if pl.Name:lower() == txt:lower() or (pl.DisplayName and pl.DisplayName:lower() == txt:lower()) then
+                    exact = pl
+                    break
+                end
+            end
+            if exact then
+                if not table.find(getgenv().Exclusions, exact.Name) then
+                    table.insert(getgenv().Exclusions, exact.Name)
+                    saveExclusions(getgenv().Exclusions)
+                    Notify("Exclusion Added", exact.Name, 2)
+                else
+                    Notify("Exclusion Info", exact.Name .. " already excluded", 2)
+                end
+            else
+                Notify("Exclusion Ambiguous", "Multiple players match '" .. txt .. "'. Type more characters.", 4)
+            end
+        else
+            local pl = matches[1]
+            if not table.find(getgenv().Exclusions, pl.Name) then
+                table.insert(getgenv().Exclusions, pl.Name)
+                saveExclusions(getgenv().Exclusions)
+                Notify("Exclusion Added", pl.Name, 2)
+            else
+                Notify("Exclusion Info", pl.Name .. " already excluded", 2)
+            end
+        end
+
+        input.Text = ""
+        refresh()
+    end)
+
+    refresh()
+    return sg
+end
+
+-- ensure GUI exists and survives respawn
+local GUI = createGui()
+Player.CharacterAdded:Connect(function()
+    -- reparent GUI to PlayerGui if necessary
+    if Player:FindFirstChild("PlayerGui") and not Player.PlayerGui:FindFirstChild("SkidFlingGUI") then
+        GUI.Parent = Player.PlayerGui
+    end
+    -- when character respawns, we want to restart scanning; we do NOT re-instate old ActiveFlingTargets
+    -- because user requested fresh scanning (do not persist previous active targets).
+    task.delay(0.25, function()
+        -- clear active flings table (they'll naturally stop when their coroutines check validity)
+        ActiveFlingTargets = {}
+    end)
+end)
+
+-- ===== Input toggle (F) =====
+UserInputService.InputBegan:Connect(function(inp, processed)
+    if processed then return end
+    if inp.UserInputType == Enum.UserInputType.Keyboard and inp.KeyCode == Enum.KeyCode.F then
+        getgenv().FlingEnabled = not getgenv().FlingEnabled
+        Notify("Fling Toggle", getgenv().FlingEnabled and "Resuming flinging" or "Flinging stopped", 3)
+    end
+end)
+
+-- ===== Phase detection: ReplicatedStorage -> GameValues -> children TextValue & TimerValue =====
+local function shouldFlingByPhase()
+    local ok, GameValues = pcall(function() return ReplicatedStorage:FindFirstChild("GameValues") end)
+    if not ok or not GameValues then return false end
+    local TextValue = GameValues:FindFirstChild("TextValue")
+    local TimerValue = GameValues:FindFirstChild("TimerValue")
+    if not TextValue or not TimerValue then return false end
+    local phase = TextValue.Value
+    local timerNum = tonumber(TimerValue.Value) or 0
+    if phase == "SURVIVE" then
+        return true
+    elseif phase == "PREPARE" and timerNum <= 13 then
+        return true
+    else
+        return false
+    end
+end
+
+-- ===== Main manager: scan for human players and spawn persistent loopfling coroutines =====
+coroutine.wrap(function()
+    while true do
+        task.wait(0.25)
+
+        if not getgenv().FlingEnabled then
+            task.wait(0.5)
+            continue
+        end
+
+        if not shouldFlingByPhase() then
+            task.wait(1)
+            continue
+        end
+
+        -- Build targets: Humans team only, not excluded, not already active
+        local queuedTargets = {}
+        for _, pl in ipairs(Players:GetPlayers()) do
+            if pl ~= Player and pl.Team and pl.Team.Name == "Humans" and pl.Character and not table.find(getgenv().Exclusions, pl.Name) then
+                if not ActiveFlingTargets[pl.UserId] then
+                    table.insert(queuedTargets, pl)
+                end
+            end
+        end
+
+        -- If none, loop again (this satisfies "continue flinging until all Humans except exclusions are off the team")
+        if #queuedTargets == 0 then
+            task.wait(0.5)
+            continue
+        end
+
+        -- Iterate queued targets; for each we spawn a persistent coroutine that repeatedly calls SkidFling(target)
+        for _, targetPlayer in ipairs(queuedTargets) do
+            if not getgenv().FlingEnabled then break end
+            if not targetPlayer or targetPlayer.Parent ~= Players then
+                -- skip invalids
+            else
+                -- mark active
+                ActiveFlingTargets[targetPlayer.UserId] = true
+
+                -- Start persistent per-target coroutine (runs until the target leaves Humans or is removed or is excluded)
+                coroutine.wrap(function(tp)
+                    -- we intentionally loop and call SkidFling(tp) repeatedly with small intervals so it persists.
+                    while true do
+                        -- break conditions:
+                        if not getgenv().FlingEnabled then break end
+                        if not tp or tp.Parent ~= Players then break end
+                        if table.find(getgenv().Exclusions, tp.Name) then break end
+                        if not tp.Team or tp.Team.Name ~= "Humans" then break end
+                        if not tp.Character then
+                            -- wait for character to exist (handles respawn)
+                            task.wait(0.5)
+                            continue
+                        end
+                        -- call protected
+                        pcall(function() SkidFling(tp) end)
+                        -- small wait to avoid tight loop inside this target's coroutine
+                        -- The per-target loopfling should persist indefinitely (until above breaks).
+                        task.wait(0.2)
+                    end
+                    -- cleanup on exit
+                    ActiveFlingTargets[tp.UserId] = nil
+                end)(targetPlayer)
+            end
+
+            -- Wait FLING_INTERVAL between starting commands for new players (stacking behavior)
+            local waited = 0
+            while waited < FLING_INTERVAL do
+                task.wait(0.1)
+                waited = waited + 0.1
+                if not getgenv().FlingEnabled then break end
+            end
+            if not getgenv().FlingEnabled then break end
+        end
+    end
+end)()
+
+-- ===== Player leaving: cleanup exclusions and active target map =====
+Players.PlayerRemoving:Connect(function(removed)
+    for idx = #getgenv().Exclusions, 1, -1 do
+        if getgenv().Exclusions[idx] == removed.Name then
+            table.remove(getgenv().Exclusions, idx)
+        end
+    end
+    saveExclusions(getgenv().Exclusions)
+    ActiveFlingTargets[removed.UserId] = nil
+end)
+
+-- ===== Welcome notification =====
+if not getgenv().Welcome then
+    Notify("Script Ready", "Type exclusions; auto-run at PREPARE<=13s and on SURVIVE. Press F to toggle.", 6)
+    getgenv().Welcome = true
+end
+
+-- ensure GUI exists
+createGui()
+
+-- End of script
