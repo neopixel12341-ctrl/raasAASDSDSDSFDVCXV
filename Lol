@@ -429,8 +429,6 @@ local function shouldFlingByPhase()
     local timerNum = tonumber(TimerValue.Value) or 0
     if phase == "SURVIVE" then
         return true
-    elseif phase == "PREPARE" and timerNum <= 13 then
-        return true
     else
         return false
     end
